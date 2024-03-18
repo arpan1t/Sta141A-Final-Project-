@@ -1,0 +1,516 @@
+---
+title: "STA 141A Final Prediction Model"
+author: "Arpan Reddy"
+date: "2024-02-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning= FALSE)
+```
+
+
+```{r, echo=FALSE, include=FALSE}
+# Load the data 
+suppressWarnings(library(tidyverse))
+suppressWarnings(library(dplyr))
+suppressWarnings(library(ggplot2))
+suppressWarnings(library(readr))
+suppressWarnings(library(tidyverse))
+suppressWarnings(library(caret))
+suppressWarnings(library(xgboost))
+suppressWarnings(library(pROC))
+suppressWarnings(library(knitr))
+session=list()
+for(i in 1:18){
+  session[[i]]=readRDS(paste('Data/session',i,'.rds',sep=''))
+}
+```
+**Abstract**
+  In this project we will be analyzing a subset of data collected by Steinmetz and build a prediction model for the success and failures of the experiment.  We will begin by analyzing various trends of the data to find features that would aid in a prediction model. We will then fine tune the parameters of our models to improve model performance. The models will be used to predict the feed back type from mice trials from session #1 and session #18. We will then select the better classification model using AUROC and accuracy rates. 
+  
+**Introduction**
+   In the whole experiment, there were 10 mice and 39 sessions but for the purposes of this project we will only be using 4 mice and 18 sessions. Each session was comprised of hundreds of trials where mice were between two screens that had varying levels of contrast and expected to move a wheel in a certain direction depending on the contrast difference. They were then either rewards or penalized based on their response. During each trial, the activity of neurons in the mice's visual cortex was recorded in various brain areas. Furthermore, if the contrast difference, which we will define as the left contrast value minus the right contrast value, was negative then a success would be moving the wheel to the left If the contrast difference was positive then the mouse would have to move the wheel to the right. If the left and right contrasts are both zero then the mouse should keep the wheel steady. Finally, if the left and right contrasts are equal and not equal to zero then a success or failure is randomly decided. In total there are 8 variables in the dataset: 'contrast_left' (this is the contrast level for the left most screen), 'contrast_right' (this is the contrast level for the right most screen), 'feedback_type' (either 1 for a success or -1 for a failure), 'mouse_name', 'brain_area' (the region of the brain associated with the neuron), 'date_exp' (date the experiment was performed), 'spks' (spike train) and 'time' (time that brain activity was recorded).
+
+**Exploratory Data Analysis**
+
+ Before we are able to build a model we need to look at trends in our data that may give us some indication of what features are important. To begin we will create a summary data table of some features of our data.
+```{r echo=FALSE, eval=TRUE, message=FALSE}
+# Summarize the information across sessions:
+
+
+# Knowing what summary we want to report, we can create a tibble:
+# All values in this function serve only as place holders
+
+n.session=length(session)
+
+# in library tidyverse
+meta <- tibble(
+  Mouse_name = rep('name',n.session),
+  Date_exp =rep('dt',n.session),
+  Number_of_brain_areas = rep(0,n.session),
+  Number_of_neurons = rep(0,n.session),
+  Number_of_trials = rep(0,n.session),
+  Overall_success_rate = rep(0,n.session),
+  #Left_success_rate = rep(0,n.session), ## added
+  #Right_success_rate = rep(0,n.session),
+  #Zero_sucess_rate = rep(0,n.session),
+)
+
+
+for(i in 1:n.session){
+  tmp = session[[i]];
+  meta[i,1]=tmp$mouse_name;
+  meta[i,2]=tmp$date_exp;
+  meta[i,3]=length(unique(tmp$brain_area));
+  meta[i,4]=dim(tmp$spks[[1]])[1];
+  meta[i,5]=length(tmp$feedback_type);
+  meta[i,6]=mean(tmp$feedback_type+1)/2;
+}
+
+unique_brain_areas <- c()
+for(i in 1:n.session){
+  unique_brain_areas <- c(unique_brain_areas ,unique(session[[i]]$brain_area))
+  unique_brain_areas <-unique(unique_brain_areas)
+}
+
+length(unique_brain_areas)
+kable(meta, format = "html", caption= "Mice Session Overview", col.names = gsub("[_]", " ", names(meta)), table.attr = "class='table table-striped'",digits=2) 
+summary(meta$Number_of_trials)
+summary(meta$Number_of_neurons)
+summary(meta$Number_of_brain_areas)
+
+```
+  From the table above we see that sessions vary in their overall success rate, number of brain areas studied, number of neurons studied, date the experiment was conducted, mice used and the number of trials. Moreover, there are 62 unique brain areas studied across all sessions with each session targeting between 5 to 15 brain areas with a median number of brain areas studied per session of 10. Across sessions, between 474 and 1769 neurons were studied, with a median number of 822.5 neurons studied per session. Having unequal number of unidentifiable neurons studied between session presents a challenge to our analysis of neuron activity and making generalizations between sessions. However, we can utilize the spike train data by averaging the neuron neuron spikes over each time bin giving us 40 average spike rates, 1 per time bin. While this allows us to utilize the spike trains, we may lose brain area specificity.
+
+```{r echo=FALSE}
+binename <- paste0("bin", as.character(1:40))
+
+get_trail_functional_data <- function(session_id, trail_id){
+  spikes <- session[[session_id]]$spks[[trail_id]]
+  if (any(is.na(spikes))){
+    disp("value missing")
+  }
+
+  trail_bin_average <- matrix(colMeans(spikes), nrow = 1)
+  colnames(trail_bin_average) <- binename
+  trail_tibble  = as_tibble(trail_bin_average)%>% add_column("trail_id" = trail_id) %>% add_column("contrast_left"= session[[session_id]]$contrast_left[trail_id]) %>% add_column("contrast_right"= session[[session_id]]$contrast_right[trail_id]) %>% add_column("feedback_type"= session[[session_id]]$feedback_type[trail_id])
+  
+  trail_tibble
+}
+get_session_functional_data <- function(session_id){
+  n_trail <- length(session[[session_id]]$spks)
+  trail_list <- list()
+  for (trail_id in 1:n_trail){
+    trail_tibble <- get_trail_functional_data(session_id,trail_id)
+    trail_list[[trail_id]] <- trail_tibble
+  }
+  session_tibble <- as_tibble(do.call(rbind, trail_list))
+  session_tibble <- session_tibble %>% add_column("mouse_name" = session[[session_id]]$mouse_name) %>% add_column("date_exp" = session[[session_id]]$date_exp) %>% add_column("session_id" = session_id) 
+  session_tibble
+}
+
+```
+```{r, echo = FALSE}
+session_list = list()
+for (session_id in 1: 18){
+  session_list[[session_id]] <- get_session_functional_data(session_id)
+}
+full_functional_tibble <- as_tibble(do.call(rbind, session_list))
+full_functional_tibble$session_id <- as.factor(full_functional_tibble$session_id )
+full_functional_tibble$contrast_diff <- full_functional_tibble$contrast_left-full_functional_tibble$contrast_right
+#tesr removed abs
+full_functional_tibble$success <- full_functional_tibble$feedback_type == 1
+full_functional_tibble$success <- as.numeric(full_functional_tibble$success)
+
+head(full_functional_tibble)
+```
+
+  In order to extract features from this dataset, we will explore the heterogeneity between different factors of this data set. One such factor is the left and right contrast level which each vary between (0, 0.25, 0.75, 1) for each trial. One question we may ask is whether or not the contrast difference affects the overall success rate of the session. If this is the case then the contrast difference may be a useful predictor in our model. We will have the contrast difference be equal to the difference between the left and right contrast for convention.
+```{r}
+#full_tibble %>% group_by(contrast_diff) %>% summarize(success_rate = mean(success, na.rm = TRUE))
+
+overall_contrasts <- full_functional_tibble %>% group_by(contrast_diff) %>% count() %>% 
+  ungroup() %>% 
+  mutate(Percentage_of_trials = `n` / sum(`n`)) %>% 
+  arrange(Percentage_of_trials) %>%
+  mutate(labels = scales::percent(Percentage_of_trials))
+
+kable(overall_contrasts, format = "html", caption= "Overall Contrast Distribution", col.names = gsub("[_]", " ", names(overall_contrasts)), table.attr = "class='table table-striped'",digits=2) 
+
+
+functional_contrast <- full_functional_tibble %>% group_by(contrast_diff) %>% summarize(success_rate = mean(success, na.rm = TRUE))
+
+kable(functional_contrast, format = "html", caption= "Success rates by Contrast difference", col.names = gsub("[_]", " ", names(functional_contrast)), table.attr = "class='table table-striped'",digits=4) 
+
+
+ggplot(overall_contrasts, aes(x = contrast_diff, y = n)) +
+  geom_bar(stat = "identity", fill = "aquamarine3") +
+  labs(x = "Contrast Difference Levels", y = "Number of trials", title = "Contrast Difference Levels vs. Number of trials")
+
+```
+
+  It seems that the majority of the trials (33.18%) had the conditions where the left contrast was equal to the right contrast while the least common conditions were those where the left contrast was 0.75 dimmer than the right contrast (6.24%). From the bar plot we can see that the distribution of contrast conditions across trials is not uniform and rather appears to be symmetric about a contrast difference level of 0. As for determining whether there is a difference in success rate between different contrast difference levels, we will look at Success Rates by Contrast Difference table. From this table it appears that the highest success rate (84.47%) is observed when the left contrast is 1 and right contrast is 0 and that the lowest success rate (62.87%) is observed when the the contrast difference is equal to 0 (the case where left contrast equals the right contrast). Since there appears to be some non zero differences in success rates between contrast difference levels, we may like to add the contrast difference into our model.
+
+Another question we may ask is how success rate changes across trials.
+```{r}
+full_functional_tibble$trail_group = cut(full_functional_tibble$trail_id, breaks = seq(0, max(full_functional_tibble$trail_id), by = 25),include.lowest = TRUE)
+levels(full_functional_tibble$trail_group) <- seq(0, max(full_functional_tibble$trail_id), by = 25)[2:18]
+
+success_rate <- aggregate(success ~ session_id + trail_group, data = full_functional_tibble, FUN = function(x) mean(x) )
+ggplot(success_rate, aes(x = trail_group, y = success)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~session_id, ncol=3) +
+      theme_bw()
+
+```
+Shown in the histograms is how the success rate changes over trials for each session. A common trend in these histograms is a tendency for the success rate to begin dropping towards the last trials. However, for the most part it appears that success rate remains mostly constant with the exception of some notable dips in the middle of session 2 and towards the end.
+
+# Dimension Reduction through PCA
+
+
+In order to reduce the dimensionality of our data we will employ various clustering and dimensionality reduction techniques on the dataset. The first method we will try is principal component analysis.
+```{r, echo = FALSE}
+features = full_functional_tibble[,1:44]
+scaled_features <- scale(features)
+pca_result <- prcomp(scaled_features)
+pc_df <- as.data.frame(pca_result$x)
+pc_df$session_id <- full_functional_tibble$session_id
+pc_df$mouse_name <- full_functional_tibble$mouse_name
+```
+
+The color of the dots correspond to difference sessions. 
+
+```{r, echo = FALSE}
+ggplot(pc_df, aes(x = PC1, y = PC2, color = session_id)) +
+  geom_point() +
+  labs(title = "PCA: PC1 vs PC2")
+
+plot(1:length(pca_result$sdev), pca_result$sdev^2,
+     type = "b", pch = 19, xlab = "Principal Component",
+     ylab = "Variance Explained", main = "PCA Scree Plot")
+```
+From the PCA plot, it is apparent that there is considerable overlap between the clusters. This may indicate that the variance in mouse data is not effectively represented by the principal components. When examining the PCA Scree plot we see that a very small amount of variance is explained by the first few PCA's. With only about 30% of the variance is explained by the first 3 PCA's, it is apparent that principal component analysis will not be meaningful in reducing the dimensionality of this dataset.
+
+
+**Data Integration**
+The bulk of the variables being fed into our final data set will be the average number of spikes per time bin. This is to account for any non obvious effect that average neuron activity over time has on a mouse's decision making process. Furthermore, since it appears that session id's have varying success rates, we will add the session number to our prediction model. To account for the variability in success rate due to contrast differences we will include individual contrast levels and the overall difference in our model. Lastly, to account for variability in success rate as trial number increases, we will include the trial number in our prediction model data set. 
+```{r echo=FALSE}
+predictive_feature <- c("session_id","trail_id","contrast_right","contrast_left", "contrast_diff" ,binename)
+head(full_functional_tibble[predictive_feature])
+predictive_data1 <- full_functional_tibble[predictive_feature]
+
+predictive_data1$trail_id <- as.numeric(predictive_data1$trail_id)
+label <- as.numeric(full_functional_tibble$success)
+X <- model.matrix(~., predictive_data1)
+```
+```{r echo=FALSE}
+# split
+set.seed(123) # for reproducibility
+trainIndex <- createDataPartition(label, p = .8, 
+                                  list = FALSE, 
+                                  times = 1)
+train_df <- predictive_data1[trainIndex, ]
+train_X <- X[trainIndex,]
+test_df <- predictive_data1[-trainIndex, ]
+test_X <- X[-trainIndex,]
+
+train_label <- label[trainIndex]
+test_label <- label[-trainIndex]
+```
+
+
+**Predictive Modeling**
+We will fit an xgboost model to our data set and analyze the performance of our model on a validation set. Xgboost is a machine learning algorithm that works by successively adding weak learners to the model, with each learner attempting to correct the error rate made by previously existing ones. We are choosing to fit an xgboost model because of its ability to handle complex relationships in our data, assumption that encoded integer values are ordinally related (as is the case with session.id and trail.id), ability to handle large numbers of variables, computational efficiency and preventative overfitting measures.
+
+Before applying our model to the given test data, we will assess our model on three different subsets of our data. First, we will see how our model performs at predicting the success of a mouse trial from any session by training the model on 80% of the data and testing it with the remaining 20% of the data. We are starting with an 80:20 split as this is a common practice in data science when working with a data set with a large number of observations. Second, we will see how our model performs at predicting the success of a mouse trial from session 1 by training the model on all the data except 50 random trials from session 1 which will be used for testing. Lastly, we will see how our model performs at predicting the success of a mouse trial from session 18 by training the model on all the data except 50 random trials from session 18 which will be used for testing. We will assess model performance using accuracy and area under the receiver operating characteristic curve (AUROC). Our naive classification threshold for accuracy will be 0.5. We choose to use AUROC rather than just using accuracy because we do not have sufficient domain knowledge within this field to pick a particular classification threshold. The AUROC curve on the other hand does not rely on a specified set threshold and rather compares true positive rate and false positive rate at every threshold level. In our case, this makes AUROC a better method for comparing models with each other.
+```{r echo=FALSE}
+#xgboost model
+xgb_model <- xgboost(data = train_X, label = train_label, objective = "binary:logistic", nrounds=10)
+
+```
+Prediction Results
+```{r echo= FALSE}
+predictions <- predict(xgb_model, newdata = test_X)
+predicted_labels <- as.numeric(ifelse(predictions > 0.5, 1, 0))
+accuracy <- mean(predicted_labels == test_label)
+accuracy
+
+#confusion matrix
+#conf_matrix <- confusionMatrix(as.factor(predicted_labels), as.factor(test_label))
+#conf_matrix$table
+
+#AUROC
+auroc <- roc(test_label, predictions)
+auroc
+```
+It appears that the xgboost model with default parameters predicts true success and failures from any session with an accuracy rate of 0.7234252 at a cut off threshold of 0.5. Furthermore, the AUROC is 0.6976, which is greater than 0.5 meaning that the model performed better than a random classifier. 
+
+```{r echo=FALSE}
+# test on 50 random trials from session 1
+set.seed(123) # for reproducibility
+session_1_row <- which(full_functional_tibble$session_id==1)
+testIndex <- sample(session_1_row, 50, replace = FALSE)
+trainIndex <- 1:nrow(full_functional_tibble)
+trainIndex <- trainIndex[!(trainIndex %in% testIndex)]
+
+train_df <- predictive_data1[trainIndex, ]
+train_X <- X[trainIndex,]
+test_df <- predictive_data1[-trainIndex, ]
+test_X <- X[-trainIndex,]
+
+train_label <- label[trainIndex]
+test_label <- label[-trainIndex]
+
+#Predictions and results
+xgb_model <- xgboost(data = train_X, label = train_label, objective = "binary:logistic", nrounds=10)
+predictions <- predict(xgb_model, newdata = test_X)
+predicted_labels <- as.numeric(ifelse(predictions > 0.5, 1, 0))
+accuracy <- mean(predicted_labels == test_label)
+accuracy
+#conf_matrix <- confusionMatrix(as.factor(predicted_labels), as.factor(test_label))
+#conf_matrix$table
+auroc <- roc(test_label, predictions)
+auroc
+```
+It appears that the xgboost model with default parameters predicts true success and failures from session #1 with an accuracy rate of 0.54 at a cut off threshold of 0.5. Furthermore, the AUROC is 0.6638, which is greater than 0.5 meaning that the model performed better than a random classifier. The accuracy at a cut off threshold of 0.5 is very bad, as 0.54 is not much better than 0.5 however the, the AUROC is not much lower than our first test on every session.
+
+```{r}
+# split
+set.seed(123) # for reproducibility
+session_18_row <- which(full_functional_tibble$session_id==18)
+testIndex <- sample(session_18_row, 50, replace = FALSE)
+trainIndex <- 1:nrow(full_functional_tibble)
+trainIndex <- trainIndex[!(trainIndex %in% testIndex)]
+
+train_df <- predictive_data1[trainIndex, ]
+train_X <- X[trainIndex,]
+test_df <- predictive_data1[-trainIndex, ]
+test_X <- X[-trainIndex,]
+
+train_label <- label[trainIndex]
+test_label <- label[-trainIndex]
+
+#prediction
+xgb_model <- xgboost(data = train_X, label = train_label, objective = "binary:logistic", nrounds=10)
+
+predictions <- predict(xgb_model, newdata = test_X)
+predicted_labels <- as.numeric(ifelse(predictions > 0.5, 1, 0))
+accuracy <- mean(predicted_labels == test_label)
+accuracy
+#conf_matrix <- confusionMatrix(as.factor(predicted_labels), as.factor(test_label))
+#conf_matrix$table
+auroc <- roc(test_label, predictions)
+auroc
+```
+It appears that the xgboost model with default parameters predicts true success and failures from session #18 with an accuracy rate of 0.76 at a cut off threshold of 0.5. Furthermore, the AUROC is 0.7775, which is greater than 0.5 meaning that the model performed better than a random classifier. It appears that this model is best suited for predicting outcomes from session #18 as this is the highest accuracy and AUROC scores we have achieved so far.
+
+In order to improve the xgboost model, we will try to decrease the learning rate to 0.1. The hope in decreasing the learning rate is to cause slower but more accurate update to the final model. However, decreasing the learning rate means we will need more steps until we converge to the optimal model. We will use cross validation to find the optimal number of boosted trees to fit the model.
+```{r}
+
+# split
+set.seed(123) # for reproducibility
+trainIndex <- createDataPartition(label, p = .8, 
+                                  list = FALSE, 
+                                  times = 1)
+train_df <- predictive_data1[trainIndex, ]
+train_X <- X[trainIndex,]
+test_df <- predictive_data1[-trainIndex, ]
+test_X <- X[-trainIndex,]
+
+train_label <- label[trainIndex]
+test_label <- label[-trainIndex]
+
+train_X <- xgb.DMatrix(data = train_X, label= train_label)
+test_X <- xgb.DMatrix(data = test_X, label = test_label)
+
+params <- list(booster = "gbtree", objective = "binary:logistic", eta=0.1, gamma=0, max_depth=6, min_child_weight=1, subsample=1, colsample_bytree=1)
+
+xgbcv <- xgb.cv( params = params, data = train_X, nrounds = 100, nfold = 5, showsd = T, stratified = T, print.every.n = 10, early.stop.round = 20, maximize = F)
+
+xgbcv$best_ntreelimit
+
+
+```
+  It appears that the optimal number of boosted trees fitted to the data is 48. To see whether this is in fact a better model then the xgboost with default parameters, we will test both models at predicting successes/failures with two sets of 100 trials from session #1 and #18 respectively. We will train both models with the entire dataset excluding the session #1 and #18 test datasets, and see their performance on each test dataset respectively. 
+  
+**Prediction Performance on Test Data**
+
+```{r echo=FALSE}
+#Data preperation
+test_sets = list()
+for(i in 1:2){
+  test_sets[[i]]=readRDS(paste('test_data/test',i,'.rds',sep=''))
+}
+
+binename <- paste0("bin", as.character(1:40))
+
+get_trail_functional_data_test <- function(session_id, trail_id){
+  spikes <- test_sets[[session_id]]$spks[[trail_id]]
+  if (any(is.na(spikes))){
+    disp("value missing")
+  }
+
+  trail_bin_average <- matrix(colMeans(spikes), nrow = 1)
+  colnames(trail_bin_average) <- binename
+  trail_tibble  = as_tibble(trail_bin_average)%>% add_column("trail_id" = trail_id) %>% add_column("contrast_left"= test_sets[[session_id]]$contrast_left[trail_id]) %>% add_column("contrast_right"= test_sets[[session_id]]$contrast_right[trail_id]) %>% add_column("feedback_type"= test_sets[[session_id]]$feedback_type[trail_id])
+  
+  trail_tibble
+}
+
+get_session_functional_data_test <- function(session_id){
+  n_trail <- length(test_sets[[session_id]]$spks)
+  trail_list <- list()
+  for (trail_id in 1:n_trail){
+    trail_tibble <- get_trail_functional_data_test(session_id,trail_id)
+    trail_list[[trail_id]] <- trail_tibble
+  }
+  session_tibble <- as_tibble(do.call(rbind, trail_list))
+  session_tibble <- session_tibble %>% add_column("mouse_name" = test_sets[[session_id]]$mouse_name) %>% add_column("date_exp" = test_sets[[session_id]]$date_exp) %>% add_column("session_id" = session_id) 
+  session_tibble
+}
+#up till this point works
+
+```
+```{r, echo = FALSE}
+test_list = list()
+for (session_id in 1: 2){
+  test_list[[session_id]] <- get_session_functional_data_test(session_id)
+}
+test_full_functional_tibble <- as_tibble(do.call(rbind, test_list))
+test_full_functional_tibble$session_id <- as.factor(test_full_functional_tibble$session_id )
+test_full_functional_tibble$contrast_diff <- test_full_functional_tibble$contrast_left-test_full_functional_tibble$contrast_right
+#test removed abs
+test_full_functional_tibble$success <- test_full_functional_tibble$feedback_type == 1
+test_full_functional_tibble$success <- as.numeric(test_full_functional_tibble$success)
+
+
+head(test_full_functional_tibble)
+
+```
+Now that the test data is in the same format as our training data, we will train both models and test them on session #1 and session #2 test data.
+```{r echo=FALSE}
+#feature selection
+session_1_test_data <- test_full_functional_tibble %>% filter(session_id == 1)
+predictive_feature_new <- c("session_id","trail_id","contrast_right","contrast_left", "contrast_diff" ,binename)
+head(session_1_test_data[predictive_feature_new])
+
+#new data matrix
+predictive_dat_new <- session_1_test_data[predictive_feature_new] 
+#predictive_dat$success <- as.numeric(predictive_dat$success)
+predictive_dat_new$trail_id <- as.numeric(predictive_dat_new$trail_id)
+label_new <- as.numeric(session_1_test_data$success)
+predictive_dat_new$session_id <- factor(predictive_dat_new$session_id, levels = 1:18)
+X_new <- model.matrix(~ ., predictive_dat_new)
+#old data matrix
+predictive_data1 <- full_functional_tibble[predictive_feature]
+#predictive_dat$success <- as.numeric(predictive_dat$success)
+predictive_data1$trail_id <- as.numeric(predictive_data1$trail_id)
+label <- as.numeric(full_functional_tibble$success)
+X <- model.matrix(~., predictive_data1)
+
+#splitting
+train_df_final <- predictive_data1
+train_X_final <- X
+test_df_final <- predictive_dat_new
+test_X_final <- X_new
+
+train_label_final <- label
+test_label_final <- label_new
+
+train_X_final <- xgb.DMatrix(data = train_X_final, label= train_label_final)
+test_X_final <- xgb.DMatrix(data = test_X_final, label = test_label_final)
+
+params <- list(booster = "gbtree", objective = "binary:logistic", eta=0.1, gamma=0, max_depth=6, min_child_weight=1, subsample=1, colsample_bytree=1)
+
+#prediction for default model
+xgb_model_ses1 <- xgboost(data = train_X_final, label = train_label_final, objective = "binary:logistic", nrounds=10)
+
+predictions_ses1 <- predict(xgb_model_ses1, newdata = test_X_final)
+predicted_labels <- as.numeric(ifelse(predictions > 0.5, 1, 0))
+accuracy <- mean(predicted_labels == test_label_final)
+accuracy
+#conf_matrix <- confusionMatrix(as.factor(predicted_labels), as.factor(test_label))
+#conf_matrix$table
+auroc_default <- roc(test_label_final, predictions_ses1)
+auroc_default
+
+#prediction for new model
+xgb_model_ses1_new <- xgboost(params, data = train_X_final, label = train_label_final, objective = "binary:logistic", nrounds= 48)
+
+predictions_ses1 <- predict(xgb_model_ses1_new, newdata = test_X_final)
+predicted_labels <- as.numeric(ifelse(predictions > 0.5, 1, 0))
+accuracy_new <- mean(predicted_labels == test_label_final)
+accuracy_new
+#conf_matrix <- confusionMatrix(as.factor(predicted_labels), as.factor(test_label))
+#conf_matrix$table
+auroc_new <- roc(test_label_final, predictions_ses1)
+auroc_new
+
+```
+  It appears that the xgboost model with default parameters predicts true success and failures from session #1 with an accuracy rate of 0.66 at a cut off threshold of 0.5. Furthermore, the AUROC is 0.65, which is greater than 0.5 meaning that the model performed better than a random classifier. On the other hand the model with the a lower learning rate and larger number of nrounds performed worse. The tuned model had an accuracy of 0.66 which is the same as the default model but had an AUROC of 0.6414 which is less than the first model. 
+```{r}
+#feature selection
+session_18_test_data <- test_full_functional_tibble %>% filter(session_id == 2) 
+session_18_test_data[session_18_test_data$session_id] <- 18 
+predictive_feature_new <- c("session_id","trail_id","contrast_right","contrast_left", "contrast_diff" ,binename)
+head(session_18_test_data[predictive_feature_new])
+
+#new data matrix
+predictive_dat_new <- session_18_test_data[predictive_feature_new] 
+#predictive_dat$success <- as.numeric(predictive_dat$success)
+predictive_dat_new$trail_id <- as.numeric(predictive_dat_new$trail_id)
+label_new <- as.numeric(session_18_test_data$success)
+predictive_dat_new$session_id <- factor(predictive_dat_new$session_id, levels = 1:18)
+X_new <- model.matrix(~ ., predictive_dat_new)
+#old data matrix
+predictive_data1 <- full_functional_tibble[predictive_feature]
+#predictive_dat$success <- as.numeric(predictive_dat$success)
+predictive_data1$trail_id <- as.numeric(predictive_data1$trail_id)
+label <- as.numeric(full_functional_tibble$success)
+X <- model.matrix(~., predictive_data1)
+
+#splitting
+train_df_final <- predictive_data1
+train_X_final <- X
+test_df_final <- predictive_dat_new
+test_X_final <- X_new
+
+train_label_final <- label
+test_label_final <- label_new
+
+train_X_final <- xgb.DMatrix(data = train_X_final, label= train_label_final)
+test_X_final <- xgb.DMatrix(data = test_X_final, label = test_label_final)
+
+params <- list(booster = "gbtree", objective = "binary:logistic", eta=0.1, gamma=0, max_depth=6, min_child_weight=1, subsample=1, colsample_bytree=1)
+
+#prediction for default model
+xgb_model_ses18 <- xgboost(data = train_X_final, label = train_label_final, objective = "binary:logistic", nrounds=10)
+
+predictions_ses18 <- predict(xgb_model_ses18, newdata = test_X_final)
+predicted_labels <- as.numeric(ifelse(predictions > 0.5, 1, 0))
+accuracy <- mean(predicted_labels == test_label_final)
+accuracy
+#conf_matrix <- confusionMatrix(as.factor(predicted_labels), as.factor(test_label))
+#conf_matrix$table
+auroc_default <- roc(test_label_final, predictions_ses18)
+auroc_default
+
+#prediction for new model
+xgb_model_ses18_new <- xgboost(params, data = train_X_final, label = train_label_final, objective = "binary:logistic", nrounds= 48)
+
+predictions_ses18 <- predict(xgb_model_ses18_new, newdata = test_X_final)
+predicted_labels <- as.numeric(ifelse(predictions > 0.5, 1, 0))
+accuracy_new <- mean(predicted_labels == test_label_final)
+accuracy_new
+#conf_matrix <- confusionMatrix(as.factor(predicted_labels), as.factor(test_label))
+#conf_matrix$table
+auroc_new <- roc(test_label_final, predictions_ses18)
+auroc_new
+
+```
+  It appears that the xgboost model with default parameters predicts true success and failures from session #18 with an accuracy rate of 0.69 at a cut off threshold of 0.5. Furthermore, the AUROC is 0.6484, which is greater than 0.5 meaning that the model performed better than a random classifier. On the other hand the model with the a lower learning rate and larger number of nrounds performed worse. The tuned model had an accuracy of 0.69 which is the same as the default model but had an AUROC of 0.624 which is less than the first model. 
+
+**Discussion**
+  Overall it seems that the xgboost model with this subset of features performed better than a random predictor but by a small margin. On the actual test data, the xgboost model with default parameters performed better than the tuned model. It appeared as though that decreasing the learning rate and increasing the number of rounds had no effect on accuracy at a 0.5 threshold and resulted in a lower AUROC. This means that the better of the two models is the standard default xgboost model with the given predictors. While the default xgboost model is better, there may be even better models utilizing different machine learning methods or utilizing aspects of the data we averaged out, such as brain areas. 
+
